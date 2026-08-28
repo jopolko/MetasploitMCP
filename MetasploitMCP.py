@@ -462,6 +462,26 @@ async def _set_module_options(module_obj: Any, options: Dict[str, Any]):
              logger.error(f"Failed to set option {k}={v} on module: {e}")
              raise ValueError(f"Failed to set option '{k}' to '{original_value}': {e}") from e
 
+def _strip_non_scalar_default_runoptions(module_obj: Any, explicit_options: Dict[str, Any]):
+    """
+    Work around a pymetasploit3 bug: MsfModule.__init__ auto-populates every
+    option's *default* into module_obj.runoptions, even when that default is
+    a list or dict (e.g. many meterpreter payloads default AutoLoadExtensions
+    to ['stdapi']). ExploitModule.execute() then merges the payload's full
+    runoptions into the handler's execute options and sends them to msfrpcd,
+    which rejects list/dict values for options it expects to be scalar with
+    "Invalid module option value ...: must be a scalar". Drop any
+    auto-populated default the caller never explicitly requested so execute()
+    doesn't ship it.
+    """
+    runopts = getattr(module_obj, '_runopts', None)
+    if not isinstance(runopts, dict):
+        return
+    for opt_name, opt_val in list(runopts.items()):
+        if opt_name not in explicit_options and isinstance(opt_val, (list, dict)):
+            logger.debug(f"Dropping non-scalar auto-populated default {opt_name}={opt_val!r} before execute().")
+            del runopts[opt_name]
+
 async def _execute_module_rpc(
     module_type: str,
     module_name: str, # Can be full path or base name
@@ -497,6 +517,7 @@ async def _execute_module_rpc(
              try:
                  payload_obj = await _get_module_object('payload', payload_name)
                  await _set_module_options(payload_obj, payload_options)
+                 _strip_non_scalar_default_runoptions(payload_obj, payload_options)
                  payload_obj_to_pass = payload_obj # Pass the configured payload object
                  logger.info(f"Executing {full_module_path} with configured payload object for '{payload_name}'.")
              except (ValueError, MsfRpcError) as e:
