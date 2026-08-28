@@ -398,6 +398,40 @@ def _parse_options_gracefully(options: Union[Dict[str, Any], str, None]) -> Dict
     except (TypeError, ValueError) as e:
         raise ValueError(f"Options must be a dictionary or comma-separated string format 'key=value,key2=value2'. Got {type(options)}: {options}")
 
+def _first_host(rhosts: Optional[str]) -> Optional[str]:
+    """Pull a single usable IP out of an RHOST(S) value for LHOST route-lookup
+    purposes (module options may hold a CIDR, range, or space/comma list)."""
+    if not rhosts:
+        return None
+    first = str(rhosts).replace(',', ' ').split()[0] if str(rhosts).strip() else None
+    if not first:
+        return None
+    return first.split('/')[0].split('-')[0]
+
+def _auto_lhost(target_hint: Optional[str] = None) -> Optional[str]:
+    """
+    Determine this machine's own address as seen from a target, instead of
+    leaving LHOST to be guessed by whatever's calling these tools. A UDP
+    connect() doesn't send a packet - it just asks the OS routing table which
+    local interface/address it would use to reach a destination, so this
+    works correctly regardless of network setup (WSL bridges, VPNs, multiple
+    NICs, etc.) without hardcoding any interface name or subnet.
+
+    Tries target_hint first (the actual target, when known - gives the most
+    accurate answer for routed/bridged targets), then falls back to a public
+    IP for a generic default route.
+    """
+    for probe in (target_hint, "1.1.1.1"):
+        if not probe:
+            continue
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.connect((probe, 1))
+                return s.getsockname()[0]
+        except OSError:
+            continue
+    return None
+
 async def _get_module_object(module_type: str, module_name: str) -> Any:
     """Gets the MSF module object, handling potential path variations."""
     client = get_msf_client()
@@ -909,7 +943,7 @@ async def list_payloads(platform: str = "", arch: str = "") -> List[str]:
 async def generate_payload(
     payload_type: str,
     format_type: str,
-    options: Union[Dict[str, Any], str], # Required: e.g., {"LHOST": "1.2.3.4", "LPORT": 4444} or "LHOST=1.2.3.4,LPORT=4444"
+    options: Union[Dict[str, Any], str], # Required: e.g., {"LHOST": "auto", "LPORT": 4444} or "LHOST=auto,LPORT=4444"
     encoder: Optional[str] = None,
     iterations: int = 0,
     bad_chars: str = "",
@@ -926,8 +960,11 @@ async def generate_payload(
     Args:
         payload_type: Type of payload (e.g., windows/meterpreter/reverse_tcp).
         format_type: Output format (raw, exe, python, etc.).
-        options: Dictionary of required payload options (e.g., {"LHOST": "1.2.3.4", "LPORT": 4444})
-                or string format "LHOST=1.2.3.4,LPORT=4444". Prefer dict format.
+        options: Dictionary of required payload options (e.g., {"LHOST": "auto", "LPORT": 4444})
+                or string format "LHOST=auto,LPORT=4444". Prefer dict format. For reverse
+                payloads, set LHOST to "auto" to have this machine's own address
+                auto-detected via OS routing rather than guessing it; omit LHOST entirely
+                for bind-type payloads that don't need it.
         encoder: Optional encoder to use.
         iterations: Optional number of encoding iterations.
         bad_chars: Optional string of bad characters to avoid (e.g., '\\x00\\x0a\\x0d').
@@ -951,6 +988,15 @@ async def generate_payload(
 
     if not parsed_options:
         return {"status": "error", "message": "Payload 'options' dictionary (e.g., LHOST, LPORT) is required."}
+
+    lhost_val = parsed_options.get('LHOST')
+    if lhost_val is not None and str(lhost_val).strip().lower() == "auto":
+        resolved_lhost = _auto_lhost(_first_host(parsed_options.get('RHOST')))
+        if resolved_lhost:
+            logger.info(f"Auto-detected LHOST={resolved_lhost} for payload {payload_type}")
+            parsed_options['LHOST'] = resolved_lhost
+        else:
+            return {"status": "error", "message": "Could not auto-detect LHOST (no route found). Pass LHOST explicitly."}
 
     try:
         # Get the payload module object
@@ -1085,8 +1131,10 @@ async def run_exploit(
         module_name: Name/path of the exploit module (e.g., 'unix/ftp/vsftpd_234_backdoor').
         options: Dictionary of exploit module options (e.g., {'RHOSTS': '192.168.1.1'}).
         payload_name: Name of the payload (e.g., 'linux/x86/meterpreter/reverse_tcp').
-        payload_options: Dictionary of payload options (e.g., {'LHOST': '...', 'LPORT': ...})
-                        or string format "LHOST=1.2.3.4,LPORT=4444". Prefer dict format.
+        payload_options: Dictionary of payload options (e.g., {'LPORT': 4444}) or string
+                        format "LPORT=4444". Omit LHOST (or set it to "auto") to have this
+                        machine's own address auto-detected via OS routing to the target -
+                        don't guess it and never set it to the target's own IP.
         run_as_job: If False (default), run sync via console. If True, run async via RPC.
         check_vulnerability: If True, run module's 'check' action first (if available).
         timeout_seconds: Max time for synchronous run via console.
@@ -1104,6 +1152,15 @@ async def run_exploit(
 
     payload_spec = None
     if payload_name:
+        lhost_val = parsed_payload_options.get('LHOST')
+        if not lhost_val or str(lhost_val).strip().lower() == "auto":
+            target_hint = _first_host(options.get('RHOSTS') or options.get('RHOST'))
+            resolved_lhost = _auto_lhost(target_hint)
+            if resolved_lhost:
+                logger.info(f"Auto-detected LHOST={resolved_lhost} for payload {payload_name} (target_hint={target_hint!r})")
+                parsed_payload_options['LHOST'] = resolved_lhost
+            elif lhost_val is None:
+                logger.warning(f"Could not auto-detect LHOST for payload {payload_name}; leaving unset.")
         payload_spec = {"name": payload_name, "options": parsed_payload_options}
 
     if check_vulnerability:
@@ -1551,8 +1608,9 @@ async def list_listeners() -> Dict[str, Any]:
 @mcp.tool()
 async def start_listener(
     payload_type: str,
-    lhost: str,
     lport: int,
+    lhost: Optional[str] = None,
+    target_hint: Optional[str] = None,
     additional_options: Optional[Union[Dict[str, Any], str]] = None,
     exit_on_session: bool = False # Option to keep listener running
 ) -> Dict[str, Any]:
@@ -1561,8 +1619,14 @@ async def start_listener(
 
     Args:
         payload_type: The payload to handle (e.g., 'windows/meterpreter/reverse_tcp').
-        lhost: Listener host address.
         lport: Listener port (1-65535).
+        lhost: Listener host address - this machine's own IP, i.e. the address the
+               target will connect back to. Leave unset (or pass "auto") to have it
+               auto-detected via OS routing; don't guess it and never set it to the
+               target's own IP or to 127.0.0.1 (the target's loopback, not yours).
+        target_hint: IP of the target you expect a callback from. Only used to improve
+               LHOST auto-detection accuracy when lhost is left unset; ignored if lhost
+               is explicitly provided.
         additional_options: Optional dict of additional payload options (e.g., {"LURI": "/path"})
                            or string format "LURI=/path,HandlerSSLCert=cert.pem". Prefer dict format.
         exit_on_session: If True, handler exits after first session. If False (default), it keeps running.
@@ -1570,6 +1634,13 @@ async def start_listener(
     Returns:
         Dictionary with handler status (job_id) or error details.
     """
+    if not lhost or lhost.strip().lower() == "auto":
+        resolved_lhost = _auto_lhost(target_hint)
+        if not resolved_lhost:
+            return {"status": "error", "message": "Could not auto-detect LHOST (no route found). Pass lhost explicitly."}
+        logger.info(f"Auto-detected LHOST={resolved_lhost} (target_hint={target_hint!r})")
+        lhost = resolved_lhost
+
     logger.info(f"Request to start listener for {payload_type} on {lhost}:{lport}. ExitOnSession: {exit_on_session}")
 
     if not (1 <= lport <= 65535):
