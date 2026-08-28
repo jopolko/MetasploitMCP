@@ -1004,6 +1004,7 @@ async def generate_payload(
 
         # Set payload-specific required options (like LHOST/LPORT)
         await _set_module_options(payload, parsed_options)
+        _strip_non_scalar_default_runoptions(payload, parsed_options)
 
         # Set payload generation options in payload.runoptions
         # as per the pymetasploit3 documentation
