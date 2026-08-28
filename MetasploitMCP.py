@@ -2,6 +2,7 @@
 import asyncio
 import base64
 import contextlib
+import difflib
 import logging
 import os
 import pathlib
@@ -410,6 +411,10 @@ async def _get_module_object(module_type: str, module_name: str) -> Any:
                  logger.warning(f"Module type mismatch: expected '{module_type}', got path starting with '{parts[0]}'. Using provided type.")
         # Else: Assume it's like 'windows/smb/ms17_010_eternalblue' - already the base name
 
+    if re.search(r'\s', base_module_name):
+        logger.error(f"Module name '{module_name}' contains whitespace; likely a typo.")
+        raise ValueError(f"Module '{module_name}' is not a valid module path (contains whitespace).")
+
     logger.debug(f"Attempting to retrieve module: client.modules.use('{module_type}', '{base_module_name}')")
     try:
         module_obj = await asyncio.to_thread(lambda: client.modules.use(module_type, base_module_name))
@@ -424,6 +429,12 @@ async def _get_module_object(module_type: str, module_name: str) -> Any:
         else:
              logger.error(f"MsfRpcError getting module {module_type}/{base_module_name}: {e}")
              raise MsfRpcError(f"Error retrieving module '{module_name}': {e}") from e
+    except TypeError as e:
+        # pymetasploit3's MsfModule.__init__ mishandles msfrpcd error responses for
+        # invalid/malformed module names (it indexes an error flag as if it were an
+        # option dict), surfacing as a bare TypeError instead of MsfRpcError/KeyError.
+        logger.error(f"Module {module_type}/{base_module_name} (from input {module_name}) appears invalid: {e}")
+        raise ValueError(f"Module '{module_name}' of type '{module_type}' not found or invalid.") from e
 
 async def _set_module_options(module_obj: Any, options: Dict[str, Any]):
     """Sets options on a module object, performing basic type guessing."""
@@ -674,8 +685,11 @@ async def _execute_module_console(
             # Execute setup commands
             for cmd in setup_commands:
                 setup_output = await run_command_safely(console, cmd, execution_timeout=DEFAULT_CONSOLE_READ_TIMEOUT)
-                # Basic error check in setup output
-                if any(err in setup_output for err in ["[-] Error setting", "Invalid option", "Unknown module", "Failed to load"]):
+                # Basic error check in setup output. "Matching Modules" means 'use' hit an
+                # ambiguous/ nonexistent path and printed a search table instead of loading
+                # a module - console stays at the top-level prompt, so later "set"/"run"
+                # commands silently no-op or fail with an unrelated error otherwise.
+                if any(err in setup_output for err in ["[-] Error setting", "Invalid option", "Unknown module", "Failed to load", "Matching Modules"]):
                     error_msg = f"Error during setup command '{cmd}': {setup_output}"
                     logger.error(error_msg)
                     return {"status": "error", "message": error_msg, "module": full_module_path}
@@ -778,6 +792,50 @@ async def list_exploits(search_term: str = "") -> List[str]:
     except Exception as e:
         logger.exception("Unexpected error listing exploits.")
         return [f"Error: Unexpected error listing exploits: {e}"]
+
+@mcp.tool()
+async def validate_module(module_type: str, module_name: str) -> Dict[str, Any]:
+    """
+    Check whether a Metasploit module actually exists, before spending a full
+    run_exploit/run_auxiliary_module/run_post_module attempt on it. This is the
+    same module lookup those tools use internally (client.modules.use), so a
+    positive result here means the follow-up call will find the module too -
+    it does not predict whether the module will succeed against the target.
+
+    Args:
+        module_type: One of 'exploit', 'auxiliary', 'post'.
+        module_name: Name/path of the module, with or without the type prefix
+            (e.g. 'scanner/http/dvwa_login' or 'auxiliary/scanner/http/dvwa_login').
+
+    Returns:
+        {"exists": true} if the module is real, otherwise {"exists": false,
+        "suggestions": [...]} with up to 5 real module names from the same
+        module tree, ranked by string similarity to what was requested -
+        use these instead of guessing a variant of the name that failed.
+    """
+    logger.info(f"Validating module existence: type='{module_type}', name='{module_name}'")
+    try:
+        await _get_module_object(module_type, module_name)
+        return {"exists": True}
+    except Exception:
+        pass  # fall through to build suggestions from the real module list
+
+    module_list_attr = {"exploit": "exploits", "auxiliary": "auxiliary", "post": "post"}.get(module_type)
+    if module_list_attr is None:
+        return {"exists": False, "suggestions": [],
+                "error": f"unknown module_type '{module_type}', expected exploit/auxiliary/post"}
+    try:
+        client = get_msf_client()
+        all_modules = await asyncio.wait_for(
+            asyncio.to_thread(lambda: getattr(client.modules, module_list_attr)),
+            timeout=RPC_CALL_TIMEOUT
+        )
+        base_name = module_name.split('/', 1)[1] if module_name.startswith(module_type + '/') else module_name
+        suggestions = difflib.get_close_matches(base_name, all_modules, n=5, cutoff=0.35)
+        return {"exists": False, "suggestions": suggestions}
+    except Exception as e:
+        logger.exception("Error building suggestions for validate_module.")
+        return {"exists": False, "suggestions": [], "error": f"suggestion lookup failed: {e}"}
 
 @mcp.tool()
 async def list_payloads(platform: str = "", arch: str = "") -> List[str]:
