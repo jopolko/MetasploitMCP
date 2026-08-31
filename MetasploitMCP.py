@@ -893,6 +893,77 @@ async def validate_module(module_type: str, module_name: str) -> Dict[str, Any]:
         return {"exists": False, "suggestions": [], "error": f"suggestion lookup failed: {e}"}
 
 @mcp.tool()
+async def validate_payload(payload_name: str, module_name: str = "") -> Dict[str, Any]:
+    """
+    Check whether a Metasploit payload actually exists (and, optionally, whether
+    it is compatible with a given exploit module) before spending a full
+    run_exploit attempt on it. This uses the same payload lookup run_exploit does
+    internally (client.modules.use('payload', ...)), so a positive result here
+    means the follow-up call will find the payload too - it does not predict
+    whether the payload will land against the target.
+
+    Args:
+        payload_name: Payload path, with or without the 'payload/' prefix
+            (e.g. 'linux/x64/meterpreter/reverse_tcp').
+        module_name: Optional exploit module (e.g.
+            'multi/http/apache_mod_cgi_bash_env_exec'). When given and valid,
+            the payload is additionally checked against that module's compatible
+            payload list.
+
+    Returns:
+        {"exists": true, "required_options": [...]} if the payload is real,
+        where required_options lists options with no default (LHOST/LPORT etc.)
+        that run_exploit will need in payload_options.
+        {"exists": false, "suggestions": [...]} otherwise, with up to 5 real
+        payload names ranked by string similarity - use these instead of
+        guessing a variant of the name that failed.
+        When module_name is supplied and valid, also
+        {"compatible": bool, "compatible_payloads": [...]} - the latter is only
+        populated (up to 15 entries) when compatible is false.
+    """
+    logger.info(f"Validating payload existence: name='{payload_name}', module='{module_name or 'none'}'")
+    base_name = payload_name.split('/', 1)[1] if payload_name.startswith('payload/') else payload_name
+    result: Dict[str, Any] = {}
+
+    try:
+        payload_obj = await _get_module_object('payload', base_name)
+        result["exists"] = True
+        try:
+            required = [
+                opt for opt in (getattr(payload_obj, 'required', None) or [])
+                if opt not in ('DUMMY',)
+            ]
+            result["required_options"] = required
+        except Exception:  # noqa: BLE001 - required-option probe is best-effort
+            result["required_options"] = []
+    except Exception:
+        client = get_msf_client()
+        try:
+            all_payloads = await asyncio.wait_for(
+                asyncio.to_thread(lambda: client.modules.payloads),
+                timeout=RPC_CALL_TIMEOUT
+            )
+            suggestions = difflib.get_close_matches(base_name, all_payloads, n=5, cutoff=0.35)
+            return {"exists": False, "suggestions": suggestions}
+        except Exception as e:  # noqa: BLE001
+            logger.exception("Error building suggestions for validate_payload.")
+            return {"exists": False, "suggestions": [], "error": f"suggestion lookup failed: {e}"}
+
+    if module_name:
+        try:
+            exploit_obj = await _get_module_object('exploit', module_name)
+            compatible = list(getattr(exploit_obj, 'payloads', None) or [])
+            if compatible:
+                is_compat = base_name in compatible
+                result["compatible"] = is_compat
+                if not is_compat:
+                    result["compatible_payloads"] = compatible[:15]
+        except Exception as e:  # noqa: BLE001 - compat check is advisory only
+            logger.warning(f"validate_payload compatibility check failed for '{module_name}': {e}")
+
+    return result
+
+@mcp.tool()
 async def list_payloads(platform: str = "", arch: str = "") -> List[str]:
     """
     List available Metasploit payloads, optionally filtered by platform and/or architecture.
